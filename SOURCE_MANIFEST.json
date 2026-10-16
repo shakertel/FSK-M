@@ -1,0 +1,24 @@
+{
+  "source_notebook": "FSK_Movies_Real_Database_Test (1).ipynb",
+  "source_sha256": "d0fbb3d89d308649bf6b2d6a515d0e918645e3354c4f91ecf90df1fc76e94a8d",
+  "batch_size": 400,
+  "model": "gemini-3.5-flash-lite",
+  "prompt_changes": false,
+  "files": {
+    "engine.py": "208c0a653766a13cdcb703bf23eae51ad49da15ab96a95ea202e2b902ee09e38",
+    "fsk_screen.py": "a95c3dbea307eb91173cee795d0b1a9b639e459200ff572f264a86f95108ba19",
+    "telegram_bot.py": "fcaf18316d612100900e5c53c17496c89f0b4eaabf25f873b3a1142fcd48ac0e",
+    "main.py": "c08fb382669b366324d34abbcd34cef526a60932a8d114cec5bcb76e3f868ef8",
+    "fsk_dataset.py": "58ecab3a0414034d38e8faec3f5ba3c5d1fdab3de87d54aaf647d0c60fccec85",
+    "smoke_check.py": "a95b9f09cde1b3bdbcbbf7afb36ad0baf775c066d650bff3ea94545b88395113",
+    "fsk_queue.py": "5ee551de5b7dbddd6a7fdc66b50b1f32853268be7f325867a068e279393af4c4",
+    "fsk_judge.py": "a036b50af30fff7ff4245a374e50d2647dd3e635d18db77c42240a3833341c87",
+    "fsk_logic.py": "acf5f79fe35024f038dc455d4baf1627e8cb1c8a11f7ca0e05d6cbfac06370b6",
+    "tests/test_bot.py": "cb12cf4b59c170f5bf70d56c00728d6968d262561deac9a540bcbce4c48a99d2"
+  },
+  "project": "FSK M",
+  "version": 2,
+  "attempt_gap_seconds": 3,
+  "live_api_parallel": 1,
+  "total_time_limit": null
+}
