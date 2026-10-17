@@ -4,8 +4,10 @@ import threading
 import time
 import html
 import io
+import re
+from urllib.parse import urlparse
 import requests
-from PIL import Image
+from PIL import Image, ImageOps
 
 from telegram import (
     Update,
@@ -37,9 +39,9 @@ PAGE_SIZE = 3
 
 WELCOME = (
     "سلام به ربات فیلم سرچر کردستان خوش آمدید! 🎬\n\n"
-    "حس و حال و فیلمی که دنبالش هستینو مثل مثال تایپ کنید و ارسال کنین همینجا:\n\n"
+    "خیلی ساده و خودمون محتوا و حس و حال و فیلمی که دنبالش هستینو مثل مثال تایپ کنید و ارسال کنین همینجا:\n\n"
     "«الان حالم خوب نیست شکست عشقی خوردم دنبال یه فیلمم "
-    "که بتونم سرگرم بشم و حالم خوب شه.»\n\n"
+    "که بتونم سرگرم بشم و درباره عشق باشه(یا چیزی هم درباره داستان نگین اوکیه) و به غصه ها فکر نکنم حالم خوب شه.»\n\n"
     "حالا درخواست خودتان را بفرستید."
 )
 
@@ -132,85 +134,6 @@ def clean_list(value, limit=4):
 # ============================================================
 # COMPACT METADATA
 # ============================================================
-
-def compact_info(x):
-
-    parts = []
-
-
-    # Country
-    countries = clean_list(
-        x.get("countries"),
-        limit=3
-    )
-
-    if countries:
-        parts.append(
-            countries
-        )
-
-
-    # IMDb
-    imdb = x.get(
-        "imdb_rating"
-    )
-
-    if imdb is not None:
-        parts.append(
-            f"{imdb} IMDb"
-        )
-
-
-    # Genres
-    genres = clean_list(
-        x.get("genres"),
-        limit=4
-    )
-
-    if genres:
-        parts.append(
-            genres
-        )
-
-
-    # Year
-    year = x.get(
-        "year"
-    )
-
-    if year:
-        parts.append(
-            str(year)
-        )
-
-
-    # Seasons
-    seasons = x.get(
-        "seasons_count"
-    )
-
-    if seasons:
-
-        try:
-            seasons = int(
-                seasons
-            )
-
-            parts.append(
-                f"{seasons} فصل"
-            )
-
-        except Exception:
-
-            parts.append(
-                str(seasons)
-            )
-
-
-    return " • ".join(
-        parts
-    )
-
 
 # ============================================================
 # /START
@@ -383,68 +306,211 @@ async def text_handler(
 
 
 
-def make_small_poster(url, idx):
-    if not url:
-        return None
-
-    try:
-        r = requests.get(
-            url,
-            timeout=12,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        r.raise_for_status()
-
-        img = Image.open(io.BytesIO(r.content)).convert("RGB")
-        img.thumbnail((180, 270))
-
-        bio = io.BytesIO()
-        img.save(
-            bio,
-            format="JPEG",
-            quality=68,
-            optimize=True
-        )
-        bio.seek(0)
-
-        return InputFile(
-            bio,
-            filename=f"poster_{idx}.jpg"
-        )
-
-    except Exception as e:
-        print("POSTER PREP ERROR", repr(e), flush=True)
-        return None
+def _one_line(value):
+    return ' '.join(str(value or '').split())
 
 
-def build_caption(idx, x):
-    star = "⭐ " if x.get("star") else ""
-    title = esc(x.get("title", "Unknown"))
-    info = esc(compact_info(x))
-    description = esc(x.get("description", ""))
-    reason = esc(x.get("reason", ""))
+def _names(value):
+    if not value:
+        return ''
+    if isinstance(value,(list,tuple)):
+        names=[]
+        for item in value:
+            if isinstance(item,dict):item=item.get('name') or item.get('title') or ''
+            text=_one_line(item)
+            if text:names.append(text)
+        return ', '.join(names)
+    return _one_line(value)
 
-    parts = [f"<b>{idx}. {star}{title}</b>"]
 
-    if info:
-        parts.append(info)
+def compact_info(x):
+    # Keep the original order; all metadata is one plain-text line.
+    parts=[]
+    country=_one_line(clean_list(x.get('countries'),limit=3))
+    genres=_one_line(clean_list(x.get('genres'),limit=4))
+    if country:parts.append(country)
+    if x.get('imdb_rating') is not None:parts.append(f"{x['imdb_rating']} IMDb")
+    if genres:parts.append(genres)
+    if x.get('year'):parts.append(_one_line(x['year']))
+    actors=_names(x.get('actors'))
+    directors=_names(x.get('directors_creators'))
+    if actors:parts.append('بازیگران: '+actors)
+    if directors:parts.append('کارگردان: '+directors)
+    return ' • '.join(parts)
 
-    if description:
-        parts.append(f"📖 {description}")
 
-    if reason:
-        parts.append(f"🎯 {reason}")
+def _utf16_length(text):
+    return len(str(text).encode('utf-16-le'))//2
 
-    if x.get("star") and x.get("star_reason"):
-        parts.append("⭐ " + esc(x.get("star_reason")))
 
-    caption = "\n\n".join(parts)
+def _visible_length(markup):
+    # Strip only our real tags, then decode escaped user/database text.
+    return _utf16_length(html.unescape(re.sub(r'<[^>]*>','',markup)))
 
-    # Photo captions are limited, so keep it safely under 1024 chars.
-    if len(caption) > 1000:
-        caption = caption[:997].rstrip() + "..."
 
-    return caption
+def _take_text(text,units):
+    prefix=text.encode('utf-16-le')[:units*2].decode('utf-16-le',errors='ignore')
+    cut=len(prefix)
+    if cut<len(text):
+        boundary=max(prefix.rfind('\n'),prefix.rfind(' '))
+        if boundary>len(prefix)*.7:cut=boundary
+    if not cut:
+        raise ValueError('Insufficient room for a text character')
+    return text[:cut].rstrip(),text[cut:].lstrip()
+
+
+def _card_header(idx,x):
+    title=f"{idx}. "+('⭐ ' if x.get('star') else '')+str(x.get('title') or 'Unknown')
+    info=compact_info(x)
+    return '<b>'+esc(title)+'</b>'+('\n\n'+esc(info) if info else '')
+
+
+def _card_sections(x):
+    sections=[]
+    for label,field in [('خلاصه داستان','description'),('دلیل پیشنهاد','reason')]:
+        text=str(x.get(field) or '').strip()
+        if text:sections.append((label,text))
+    evidence=x.get('audience_evidence') or []
+    if isinstance(evidence,str):evidence=[evidence]
+    if isinstance(evidence,(list,tuple)):
+        evidence=[str(v).strip() for v in evidence[:4] if str(v).strip()]
+        if evidence:sections.append(('شواهد مخاطبان','\n'.join('• '+v for v in evidence)))
+    if x.get('warning'):sections.append(('نکته',str(x['warning']).strip()))
+    if x.get('star') and x.get('star_reason'):
+        sections.append(('دلیل ستاره',str(x['star_reason']).strip()))
+    return sections
+
+
+def _quote(label,text):
+    return '<b>'+esc(label)+':</b>\n<blockquote expandable>'+esc(text)+'</blockquote>'
+
+
+def build_caption(idx,x):
+    # Never cut generated HTML: it can break tags/entities and even fail photo sending.
+    return '\n\n'.join([_card_header(idx,x)]+[_quote(label,text) for label,text in _card_sections(x)])
+
+
+def _message_parts(header,sections,limit=4096):
+    # Expandable quotes still count against Telegram's character limit.
+    parts=[]
+    current=''
+    if header:
+        if _visible_length(header)<=limit:
+            current=header
+        else:
+            plain=html.unescape(re.sub(r'<[^>]*>','',header))
+            while plain:
+                piece,plain=_take_text(plain,limit)
+                parts.append(esc(piece))
+    for label,text in sections:
+        text=str(text).strip()
+        continued=False
+        while text:
+            heading=label+(' (ادامه)' if continued else '')
+            budget=limit-_utf16_length(heading+':\n')
+            if budget<2:raise ValueError('Section heading too long')
+            piece,remainder=_take_text(text,budget)
+            block=_quote(heading,piece)
+            combined=(current+'\n\n' if current else '')+block
+            if _visible_length(combined)>limit:
+                if current:parts.append(current)
+                current=block
+            else:
+                current=combined
+            text=remainder
+            continued=True
+    if current:parts.append(current)
+    if any(_visible_length(part)>limit for part in parts):
+        raise ValueError('Message too long')
+    return parts
+
+
+def _poster_url(value):
+    url=html.unescape(str(value or '').strip())
+    if url.startswith('//'):url='https:'+url
+    return url if urlparse(url).scheme in ('https','http') and urlparse(url).hostname else ''
+
+
+def _poster_error(stage,url,exc):
+    detail=str(exc)
+    for name in ['TELEGRAM_TOKEN','SUPABASE_SECRET_KEY']+[f'GEMINI_KEY_{i}' for i in range(1,15)]:
+        secret=os.getenv(name)
+        if secret:detail=detail.replace(secret,'[REDACTED]')
+    print(f'POSTER {stage} | host={urlparse(url).hostname} | {type(exc).__name__}: {detail[:250]}',flush=True)
+
+
+def make_small_poster(url,idx):
+    url=_poster_url(url)
+    if not url:return None
+    parsed=urlparse(url)
+    # A normal browser referer can be required by a host's hotlink policy.
+    for with_referer in (False,True):
+        headers={'User-Agent':'Mozilla/5.0','Accept':'image/avif,image/webp,image/*,*/*;q=0.8'}
+        if with_referer:headers['Referer']=f'{parsed.scheme}://{parsed.netloc}/'
+        try:
+            with requests.get(url,timeout=(4,8),headers=headers,stream=True) as response:
+                print(f'POSTER HTTP | host={parsed.hostname} | status={response.status_code} | type={response.headers.get('Content-Type','unknown')} | referer={with_referer}',flush=True)
+                if response.status_code==403 and not with_referer:continue
+                response.raise_for_status()
+                raw=bytearray()
+                for chunk in response.iter_content(65536):
+                    raw.extend(chunk)
+                    if len(raw)>10*1024*1024:raise ValueError('Image download exceeds 10 MiB')
+            with Image.open(io.BytesIO(raw)) as source:
+                if source.width*source.height>25_000_000:raise ValueError('Image dimensions too large')
+                image=ImageOps.exif_transpose(source).convert('RGB')
+                image.thumbnail((360,540))
+                output=io.BytesIO();image.save(output,'JPEG',quality=82,optimize=True)
+                output.seek(0)
+            return InputFile(output,filename=f'poster_{idx}.jpg')
+        except Exception as exc:
+            _poster_error('DOWNLOAD FAILED',url,exc)
+            return None
+    return None
+
+
+async def _send_movie_card(chat_id,context,idx,x):
+    header=_card_header(idx,x)
+    sections=_card_sections(x)
+    full=build_caption(idx,x)
+    if _visible_length(full)<=1024:
+        photo_caption=full
+        remaining=[]
+    elif _visible_length(header)<=1024:
+        photo_caption=header
+        remaining=_message_parts('',sections)
+    else:
+        photo_caption='<b>'+esc(str(x.get('title') or 'Unknown'))+'</b>'
+        if _visible_length(photo_caption)>1024:photo_caption=''
+        remaining=_message_parts(header,sections)
+    url=_poster_url(x.get('poster_url'))
+    photo_sent=False
+    if url:
+        # Telegram can sometimes retrieve a public URL that this server cannot fetch.
+        try:
+            await context.bot.send_photo(chat_id=chat_id,photo=url,caption=photo_caption,
+                parse_mode='HTML',read_timeout=20,write_timeout=30,connect_timeout=10,pool_timeout=10)
+            photo_sent=True
+            print('POSTER SENT | route=telegram_url',flush=True)
+        except Exception as exc:
+            _poster_error('TELEGRAM URL FAILED',url,exc)
+        if not photo_sent:
+            poster_file=await asyncio.to_thread(make_small_poster,url,idx)
+            if poster_file:
+                try:
+                    await context.bot.send_photo(chat_id=chat_id,photo=poster_file,caption=photo_caption,
+                        parse_mode='HTML',read_timeout=20,write_timeout=30,connect_timeout=10,pool_timeout=10)
+                    photo_sent=True
+                    print('POSTER SENT | route=uploaded_jpeg',flush=True)
+                except Exception as exc:
+                    _poster_error('FILE UPLOAD FAILED',url,exc)
+    texts=remaining if photo_sent else _message_parts(header,sections)
+    for index,text in enumerate(texts):
+        kwargs={}
+        if not photo_sent and url and index==len(texts)-1:
+            kwargs['reply_markup']=InlineKeyboardMarkup([[InlineKeyboardButton('🖼 دیدن پوستر',url=url)]])
+        await context.bot.send_message(chat_id=chat_id,text=text,parse_mode='HTML',
+            disable_web_page_preview=True,**kwargs)
 
 
 # ============================================================
@@ -475,39 +541,7 @@ async def show_page(
     for idx in range(pos, end):
         x = results[idx]
 
-        caption = build_caption(
-            idx + 1,
-            x
-        )
-
-        poster_file = make_small_poster(
-            x.get("poster_url"),
-            idx + 1
-        )
-
-        if poster_file:
-            try:
-                await context.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=poster_file,
-                    caption=caption,
-                    parse_mode="HTML"
-                )
-                continue
-
-            except Exception as e:
-                print(
-                    "SEND PHOTO/CAPTION ERROR",
-                    repr(e),
-                    flush=True
-                )
-
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=caption,
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
+        await _send_movie_card(chat_id,context,idx+1,x)
 
     st["pos"] = end
     touch(uid)
@@ -595,7 +629,7 @@ async def confirm_search(
     await query_obj.message.reply_text(
 
         "🔎 جستجو شروع شد. "
-        "ممکن است چند دقیقه طول بکشد.پیروز بیت ❤️",
+        "ممکن است ۵ دقیقه طول بکشد.پیروز بیت ❤️",
 
         reply_markup=keyboard(
             [
@@ -667,7 +701,7 @@ async def confirm_search(
 
 
         await query_obj.message.reply_text(
-            f"✅ {len(results)} پیشنهاد آماده شد."
+            f"✅ {len(results)} پیشنهاد آماده شد گُلَگَم🌹."
         )
 
 
