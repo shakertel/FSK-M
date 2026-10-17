@@ -5,6 +5,8 @@ import time
 import html
 import io
 import re
+import math
+import secrets
 from urllib.parse import urlparse
 import requests
 from PIL import Image, ImageOps
@@ -36,12 +38,57 @@ from engine import FSKEngine, SearchCancelled
 
 SEARCH_TIMEOUT = 15 * 60
 PAGE_SIZE = 3
+SORT_OPTIONS = {
+    "default": "ترتیب فعلی (بهترین)",
+    "imdb": "نمره IMDb",
+    "match": "تطابق بالاتر با درخواست ⭐",
+    "newest": "فیلم‌های جدیدتر",
+}
+
+
+def _sort_number(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(str(value).strip().replace("٫", "."))
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _match_score(item):
+    for field in ("total_score", "score"):
+        value = _sort_number(item.get(field))
+        if value is not None:
+            return value
+    return None
+
+
+def order_final_results(results, mode):
+    """Order completed Gemini results for display only; stable on ties."""
+    items = list(results)
+    if mode == "match":
+        if not any(_match_score(item) is not None for item in items):
+            return sorted(items, key=lambda item: item.get("star") is True, reverse=True)
+        def key(item):
+            score = _match_score(item)
+            return (score is not None, score if score is not None else 0,
+                    item.get("star") is True if score is None else False)
+        return sorted(items, key=key, reverse=True)
+    if mode in ("imdb", "newest"):
+        field = "imdb_rating" if mode == "imdb" else "year"
+        def key(item):
+            value = _sort_number(item.get(field))
+            valid = value is not None and value > 0
+            return (valid, value if valid else 0)
+        return sorted(items, key=key, reverse=True)
+    return items
 
 WELCOME = (
     "سلام به ربات فیلم سرچر کردستان خوش آمدید! 🎬\n\n"
-    "خیلی ساده و خودمون محتوا و حس و حال و فیلمی که دنبالش هستینو مثل مثال تایپ کنید و ارسال کنین همینجا:\n\n"
+    "حس و حال و فیلمی که دنبالش هستینو مثل مثال تایپ کنید و ارسال کنین همینجا:\n\n"
     "«الان حالم خوب نیست شکست عشقی خوردم دنبال یه فیلمم "
-    "که بتونم سرگرم بشم و درباره عشق باشه(یا چیزی هم درباره داستان نگین اوکیه) و به غصه ها فکر نکنم حالم خوب شه.»\n\n"
+    "که بتونم سرگرم بشم و حالم خوب شه.»\n\n"
     "حالا درخواست خودتان را بفرستید."
 )
 
@@ -273,34 +320,19 @@ async def text_handler(
         return
 
 
+    token = secrets.token_hex(4)
     states[uid] = {
-        "stage": "confirm",
+        "stage": "choose_sort",
         "query": q,
+        "sort_token": token,
         "last_activity": time.monotonic()
     }
-
-
     await update.message.reply_text(
-
-        "درخواست شما:\n\n"
-        + q
-        + "\n\nآیا این پیام نهایی شماست کاکه گیان؟؟",
-
+        "نتایج نهایی بر چه اساس نمایش داده شوند؟",
         reply_markup=keyboard(
-
-            [
-                (
-                    "تأیید و جستجو بژی کوردیستان✅",
-                    "confirm"
-                )
-            ],
-
-            [
-                (
-                    "لغو ❌",
-                    "cancel"
-                )
-            ]
+            *[[(label, f"sort:{token}:{mode}")]
+              for mode, label in SORT_OPTIONS.items()],
+            [("لغو ❌", "cancel")]
         )
     )
 
@@ -629,7 +661,7 @@ async def confirm_search(
     await query_obj.message.reply_text(
 
         "🔎 جستجو شروع شد. "
-        "ممکن است ۵ دقیقه طول بکشد.پیروز بیت ❤️",
+        "ممکن است چند دقیقه طول بکشد.پیروز بیت ❤️",
 
         reply_markup=keyboard(
             [
@@ -681,7 +713,11 @@ async def confirm_search(
         )
 
 
+        sort_mode = states[uid].get("sort_mode", "default")
+        results = order_final_results(results, sort_mode)
+
         states[uid] = {
+            "sort_mode": sort_mode,
 
             "stage":
                 "results",
@@ -701,7 +737,7 @@ async def confirm_search(
 
 
         await query_obj.message.reply_text(
-            f"✅ {len(results)} پیشنهاد آماده شد گُلَگَم🌹."
+            f"✅ {len(results)} پیشنهاد آماده شد."
         )
 
 
@@ -880,6 +916,28 @@ async def buttons(
         uid
     )
 
+
+    # Presentation preference stays out of the query and Gemini prompts.
+    if data and data.startswith("sort:"):
+        parts = data.split(":")
+        if (len(parts) != 3 or st.get("stage") != "choose_sort"
+                or parts[1] != st.get("sort_token") or parts[2] not in SORT_OPTIONS):
+            await q.answer("این دکمه دیگر فعال نیست.")
+            return
+        mode = parts[2]
+        st.update(stage="confirm", sort_mode=mode)
+        st.pop("sort_token", None)
+        await q.answer()
+        await q.message.reply_text(
+            "درخواست شما:\n\n" + st["query"]
+            + "\n\nترتیب نمایش: " + SORT_OPTIONS[mode]
+            + "\n\nآیا این پیام نهایی شماست کاکه گیان؟؟",
+            reply_markup=keyboard(
+                [("تأیید و جستجو بژی کوردیستان✅", "confirm")],
+                [("لغو ❌", "cancel")]
+            )
+        )
+        return
 
     # Confirm
     if (
