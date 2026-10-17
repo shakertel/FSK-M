@@ -8,6 +8,7 @@ import re
 import math
 import secrets
 import uuid
+from collections import deque
 from urllib.parse import urlparse
 import requests
 from PIL import Image, ImageOps
@@ -137,6 +138,8 @@ def touch(uid):
 
 def clear_user(uid):
 
+    SEARCH_QUEUE.cancel(uid)
+
     ev = jobs.pop(
         uid,
         None
@@ -215,7 +218,7 @@ async def _require_access(update):
     states[uid] = {"stage": "awaiting_password", "last_activity": time.monotonic()}
     if update.callback_query:
         await update.callback_query.answer()
-    await update.effective_message.reply_text(PASSWORD_PROMPT)
+    await update.effective_message.reply_text(PASSWORD_PROMPT + SEARCH_QUEUE.busy_notice(uid))
     return False
 
 
@@ -242,7 +245,7 @@ async def _login_password(update):
     if result == "ok":
         states[update.effective_user.id] = {"stage": "awaiting_query", "last_activity": time.monotonic()}
         summary = await _quota_summary(update.effective_user.id)
-        await update.message.reply_text("✅ دسترسی تأیید شد.\n" + summary + "\n\n" + WELCOME)
+        await update.message.reply_text("✅ دسترسی تأیید شد.\n" + summary + "\n\n" + WELCOME + SEARCH_QUEUE.busy_notice(update.effective_user.id))
     elif result == "throttled":
         await update.message.reply_text("تلاش‌ها زیاد شد؛ یک دقیقه دیگر رمز را امتحان کنید.")
     else:
@@ -264,7 +267,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except AccessUnavailable:
         await update.effective_message.reply_text(ACCESS_ERROR)
         return
-    await update.effective_message.reply_text(PASSWORD_PROMPT)
+    await update.effective_message.reply_text(PASSWORD_PROMPT + SEARCH_QUEUE.busy_notice(uid))
 
 
 # ============================================================
@@ -351,6 +354,15 @@ async def text_handler(
     )
 
 
+    if st and st.get("stage") == "queued":
+        position = SEARCH_QUEUE.position(uid)
+        text = (f"⏳ درخواست شما در صف است؛ نوبت انتظار: {position}."
+                if position else "⏳ نوبت شما رسیده؛ جست‌وجو در حال آماده‌سازی است.")
+        await update.message.reply_text(
+            text, reply_markup=keyboard([("لغو نوبت ❌", "cancel")])
+        )
+        return
+
     if (
         st
         and st.get("stage")
@@ -383,6 +395,7 @@ async def text_handler(
         return
 
 
+    clear_user(uid)
     token = secrets.token_hex(4)
     states[uid] = {
         "stage": "choose_sort",
@@ -392,7 +405,7 @@ async def text_handler(
         "last_activity": time.monotonic()
     }
     await update.message.reply_text(
-        "نتایج نهایی بر چه اساس نمایش داده شوند؟",
+        "نتایج نهایی بر چه اساس نمایش داده شوند؟" + SEARCH_QUEUE.busy_notice(uid),
         reply_markup=keyboard(
             *[[(label, f"sort:{token}:{mode}")]
               for mode, label in SORT_OPTIONS.items()],
@@ -684,230 +697,217 @@ async def run_search(
 # CONFIRM SEARCH
 # ============================================================
 
-async def confirm_search(
-    query_obj,
-    context
-):
+class SearchQueue:
+    """One Gemini search at a time; Telegram handlers remain responsive."""
+    def __init__(self):
+        self.pending = deque()
+        self.active = None
+        self.worker = None
+        self.deliveries = {}
 
+    @staticmethod
+    def spawn(coroutine, context):
+        application = getattr(context, "application", None)
+        if application is not None and application.running:
+            return application.create_task(coroutine)
+        return asyncio.create_task(coroutine)
+
+    @staticmethod
+    def current(request):
+        return (not request["event"].is_set()
+                and states.get(request["uid"]) is request["state"])
+
+    def position(self, uid):
+        waiting = [r for r in self.pending if self.current(r)]
+        return next((i for i, r in enumerate(waiting, 1) if r["uid"] == uid), None)
+
+    def busy_notice(self, uid):
+        busy = ((self.active is not None and self.active["uid"] != uid)
+                or any(self.current(r) and r["uid"] != uid for r in self.pending))
+        if not busy:
+            return ""
+        return ("\n\n⏳ ربات فعلاً درگیر جست‌وجوی دیگری است. "
+                "درخواستت را بنویس و تأیید کن تا به‌ترتیب نوبت، خودکار شروع شود.")
+
+    def cancel(self, uid):
+        if self.active is not None and self.active["uid"] == uid:
+            # Do not cancel the asyncio wrapper: its thread may still call Gemini.
+            self.active["event"].set()
+        for request in self.pending:
+            if request["uid"] == uid:
+                request["event"].set()
+        self.pending = deque(r for r in self.pending if r["uid"] != uid)
+        delivery = self.deliveries.get(uid)
+        if delivery:
+            delivery[0]["event"].set()
+            if delivery[1] is not asyncio.current_task():
+                delivery[1].cancel()
+
+    def enqueue(self, request):
+        self.pending.append(request)
+        jobs[request["uid"]] = request["event"]
+        print(f'SEARCH QUEUE | enqueued user={request["uid"]} | waiting={len(self.pending)}', flush=True)
+        if self.worker is None or self.worker.done():
+            self.worker = self.spawn(self._drain(), request["context"])
+
+    async def _drain(self):
+        try:
+            while self.pending:
+                request = self.pending.popleft()
+                if not self.current(request):
+                    continue
+                self.active = request
+                try:
+                    print(f'SEARCH QUEUE | starting user={request["uid"]} | waiting={len(self.pending)}', flush=True)
+                    results = await _execute_search(request)
+                    # Release the Gemini slot before sending posters and pagination.
+                    if results is not None and self.current(request):
+                        task = self.spawn(self._deliver(request, results), request["context"])
+                        self.deliveries[request["uid"]] = (request, task)
+                except Exception as exc:
+                    print(f'SEARCH QUEUE ERROR | {type(exc).__name__}', flush=True)
+                    if self.current(request):
+                        request["state"]["stage"] = "awaiting_query"
+                        try:
+                            await request["query_obj"].message.reply_text(
+                                "جستجو با خطا متوقف شد؛ درخواست جدیدتان را بفرستید.")
+                        except TelegramError:
+                            pass
+                finally:
+                    if jobs.get(request["uid"]) is request["event"]:
+                        jobs.pop(request["uid"], None)
+                    self.active = None
+        finally:
+            self.worker = None
+
+    async def _deliver(self, request, results):
+        uid = request["uid"]
+        try:
+            if not self.current(request):
+                return
+            result_state = {
+                "stage": "results", "query": request["query"],
+                "sort_mode": request["sort_mode"],
+                "results": order_final_results(results, request["sort_mode"]),
+                "pos": 0, "last_activity": time.monotonic(),
+            }
+            states[uid] = result_state
+            request["state"] = result_state
+            summary = await _quota_summary(uid)
+            if not self.current(request):
+                return
+            await request["query_obj"].message.reply_text(
+                f"✅ {len(results)} پیشنهاد آماده شد.\n{summary}")
+            if self.current(request):
+                await show_page(request["query_obj"].message.chat_id, uid, request["context"])
+        except TelegramError as exc:
+            print(f'SEARCH PRESENTATION ERROR | {type(exc).__name__}', flush=True)
+        finally:
+            entry = self.deliveries.get(uid)
+            if entry and entry[0] is request:
+                self.deliveries.pop(uid, None)
+
+
+SEARCH_QUEUE = SearchQueue()
+
+
+async def confirm_search(query_obj, context):
     uid = query_obj.from_user.id
-
-    chat_id = (
-        query_obj.message.chat_id
-    )
-
-
-    if uid in jobs:
-
-        await query_obj.answer(
-            "یک جستجو در حال اجراست."
-        )
-
+    st = states.get(uid)
+    if uid in jobs or (st and st.get("stage") in ("queued", "searching")):
+        await query_obj.answer("درخواست شما قبلاً ثبت شده است.")
         return
-
-
+    if not st or st.get("stage") != "confirm":
+        await query_obj.answer("این دکمه دیگر فعال نیست.")
+        return
     await query_obj.answer()
+    request = {
+        "uid": uid, "query": st["query"], "sort_mode": st.get("sort_mode", "default"),
+        "request_id": st["request_id"], "state": st, "event": threading.Event(),
+        "query_obj": query_obj, "context": context,
+    }
+    st["stage"] = "queued"
+    st["last_activity"] = time.monotonic()
+    waiting = sum(SEARCH_QUEUE.current(r) for r in SEARCH_QUEUE.pending)
+    if SEARCH_QUEUE.active is not None or waiting:
+        try:
+            await query_obj.message.reply_text(
+                f"⏳ ربات فعلاً مشغول است. نوبت انتظار شما: {waiting + 1}.\n"
+                "با رسیدن نوبت، جست‌وجو خودکار شروع می‌شود؛ فعلاً سهمیه‌ای کم نشده.",
+                reply_markup=keyboard([("لغو نوبت ❌", "cancel")]))
+        except TelegramError:
+            st["stage"] = "confirm"
+            raise
+    SEARCH_QUEUE.enqueue(request)
 
 
-    # The debit is atomic and persistent; a retry uses the same request ID.
+async def _execute_search(request):
+    uid, st, ev = request["uid"], request["state"], request["event"]
+    message = request["query_obj"].message
+    context = request["context"]
+    st["stage"] = "searching"
     try:
-        quota = await asyncio.to_thread(
-            access.reserve, uid, states[uid]["request_id"]
-        )
+        quota = await asyncio.to_thread(access.reserve, uid, request["request_id"])
     except AccessUnavailable:
-        await query_obj.message.reply_text(
-            ACCESS_ERROR,
-            reply_markup=keyboard([("تلاش دوباره", "confirm")], [("لغو ❌", "cancel")])
-        )
-        return
+        if SEARCH_QUEUE.current(request):
+            st["stage"] = "confirm"
+            await message.reply_text(ACCESS_ERROR,
+                reply_markup=keyboard([("تلاش دوباره", "confirm")], [("لغو ❌", "cancel")]))
+        return None
+    if not SEARCH_QUEUE.current(request):
+        return None
     if not quota["allowed"]:
         reason = quota.get("reason")
+        st["stage"] = "confirm"
         if reason == "auth":
-            clear_user(uid)
-            states[uid] = {"stage": "awaiting_password", "last_activity": time.monotonic()}
+            st["stage"] = "awaiting_password"
             text = PASSWORD_PROMPT
         elif reason == "daily":
             text = "سهمیهٔ امروز شما تمام شده؛ از نیمه‌شب به وقت تهران دوباره می‌توانید جست‌وجو کنید."
         else:
-            text = "سهمیهٔ یک ساعت اخیر شما تمام شده؛ پس از گذشت یک ساعت از جست‌وجوهای قبلی دوباره امتحان کنید."
+            text = "سهمیهٔ یک ساعت اخیر شما تمام شده؛ بعداً دوباره امتحان کنید."
         if reason != "auth":
             text += "\n" + quota_text(quota)
-        await query_obj.message.reply_text(text)
-        return
-
-    ev = threading.Event()
-
-    jobs[uid] = ev
-
-
-    states[uid][
-        "stage"
-    ] = "searching"
-
-    touch(
-        uid
-    )
-
-
-    await query_obj.message.reply_text(
-
-        "🔎 جستجو شروع شد. "
-        "ممکن است چند دقیقه طول بکشد.پیروز بیت ❤️"
-        + "\n" + quota_text(quota),
-
-        reply_markup=keyboard(
-            [
-                (
-                    "لغو جستجو ❌",
-                    "cancel"
-                )
-            ]
-        )
-    )
-
-
+        await message.reply_text(text)
+        return None
+    st["stage"] = "searching"
+    await message.reply_text(
+        "🔎 نوبت شماست؛ جستجو شروع شد. پیروز بیت ❤️\n" + quota_text(quota),
+        reply_markup=keyboard([("لغو جستجو ❌", "cancel")]))
+    if not SEARCH_QUEUE.current(request):
+        return None
+    engine_task = asyncio.create_task(run_search(request["query"], ev))
     try:
-
-        results = await asyncio.wait_for(
-
-            run_search(
-                states[uid]["query"],
-                ev
-            ),
-
-            timeout=SEARCH_TIMEOUT
-        )
-
-
-        if (
-            ev.is_set()
-            or uid not in states
-        ):
-
-            return
-
-
+        results = await asyncio.wait_for(asyncio.shield(engine_task), timeout=SEARCH_TIMEOUT)
+        if not SEARCH_QUEUE.current(request):
+            return None
         if not results:
-
-            raise RuntimeError(
-                "نتیجه‌ای پیدا نشد"
-            )
-
-
-        jobs.pop(
-            uid,
-            None
-        )
-
-
-        original_query = (
-            states[uid]["query"]
-        )
-
-
-        sort_mode = states[uid].get("sort_mode", "default")
-        results = order_final_results(results, sort_mode)
-
-        states[uid] = {
-            "sort_mode": sort_mode,
-
-            "stage":
-                "results",
-
-            "query":
-                original_query,
-
-            "results":
-                results,
-
-            "pos":
-                0,
-
-            "last_activity":
-                time.monotonic()
-        }
-
-
-        summary = await _quota_summary(uid)
-        await query_obj.message.reply_text(
-            f"✅ {len(results)} پیشنهاد آماده شد.\n{summary}"
-        )
-
-
-        await show_page(
-            chat_id,
-            uid,
-            context
-        )
-
-
+            raise RuntimeError("نتیجه‌ای پیدا نشد")
+        return results
     except asyncio.TimeoutError:
-
+        current = SEARCH_QUEUE.current(request)
         ev.set()
-
-        jobs.pop(
-            uid,
-            None
-        )
-
-        states[uid] = {
-            "stage": "awaiting_query",
-            "last_activity": time.monotonic()
-        }
-
-
-        await context.bot.send_message(
-
-            chat_id=chat_id,
-
-            text=(
-                "⏱ جستجو بعد از ۱۵ دقیقه "
-                "متوقف شد تا ربات گیر نکند. "
-                "درخواست جدیدتان را بفرستید."
-            )
-        )
-
-
+        if current:
+            st["stage"] = "awaiting_query"
+            await message.reply_text("⏱ جستجو بعد از ۱۵ دقیقه متوقف شد. درخواست جدیدتان را بفرستید.")
     except SearchCancelled:
-
-        jobs.pop(
-            uid,
-            None
-        )
-
-
-    except Exception as e:
-
-        ev.set()
-
-        jobs.pop(
-            uid,
-            None
-        )
-
-
-        states[uid] = {
-            "stage": "awaiting_query",
-            "last_activity": time.monotonic()
-        }
-
-
-        print(
-            "SEARCH ERROR",
-            repr(e),
-            flush=True
-        )
-
-
-        await context.bot.send_message(
-
-            chat_id=chat_id,
-
-            text=(
-                "جستجو با خطا متوقف شد و "
-                "ربات دوباره آماده است. "
-                "درخواستتان را دوباره بفرستید."
-            )
-        )
+        pass
+    except Exception as exc:
+        print(f'SEARCH ERROR | {type(exc).__name__}', flush=True)
+        if SEARCH_QUEUE.current(request):
+            st["stage"] = "awaiting_query"
+            await message.reply_text("جستجو با خطا متوقف شد؛ درخواستتان را دوباره بفرستید.")
+    finally:
+        if not engine_task.done():
+            ev.set()
+            print(f'SEARCH QUEUE | finishing cancelled engine user={uid}', flush=True)
+            # A cancelled to_thread coroutine does not stop its underlying thread.
+            # Keep the global slot until it exits, including in-flight HTTP requests.
+            try:
+                await asyncio.shield(engine_task)
+            except (Exception, asyncio.CancelledError):
+                pass
+    return None
 
 
 # ============================================================
@@ -939,6 +939,11 @@ async def buttons(
 
         return
 
+
+    if (states.get(uid, {}).get("stage") in ("queued", "searching")
+            and data in ("enough", "new", "confirm")):
+        await q.answer("درخواست شما قبلاً ثبت شده؛ برای توقف، لغو را بزنید.")
+        return
 
     # Enough
     if data == "enough":
