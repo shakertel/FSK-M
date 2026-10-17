@@ -7,6 +7,7 @@ import io
 import re
 import math
 import secrets
+import uuid
 from urllib.parse import urlparse
 import requests
 from PIL import Image, ImageOps
@@ -30,6 +31,7 @@ from telegram.ext import (
 from telegram.error import TelegramError
 
 from engine import FSKEngine, SearchCancelled
+from access_control import AccessControl, AccessUnavailable, quota_text
 
 
 # ============================================================
@@ -98,6 +100,7 @@ WELCOME = (
 # ============================================================
 
 engine = None
+access = None
 
 states = {}
 jobs = {}
@@ -182,37 +185,86 @@ def clean_list(value, limit=4):
 # COMPACT METADATA
 # ============================================================
 
+PASSWORD_PROMPT = "🔐 برای ورود، رمز دسترسی را بفرستید."
+ACCESS_ERROR = "بررسی دسترسی فعلاً ممکن نیست. کمی بعد دوباره امتحان کنید."
+
+
+async def _private_chat(update):
+    if update.effective_chat and update.effective_chat.type == "private":
+        return True
+    if update.callback_query:
+        await update.callback_query.answer()
+    await update.effective_message.reply_text("برای استفاده، در گفت‌وگوی خصوصی ربات /start را بزنید.")
+    return False
+
+
+async def _require_access(update):
+    if not await _private_chat(update):
+        return False
+    try:
+        allowed = await asyncio.to_thread(access.authorized, update.effective_user.id)
+    except AccessUnavailable:
+        if update.callback_query:
+            await update.callback_query.answer()
+        await update.effective_message.reply_text(ACCESS_ERROR)
+        return False
+    if allowed:
+        return True
+    uid = update.effective_user.id
+    clear_user(uid)
+    states[uid] = {"stage": "awaiting_password", "last_activity": time.monotonic()}
+    if update.callback_query:
+        await update.callback_query.answer()
+    await update.effective_message.reply_text(PASSWORD_PROMPT)
+    return False
+
+
+async def _quota_summary(uid):
+    try:
+        status = await asyncio.to_thread(access.quota_status, uid)
+    except AccessUnavailable:
+        return "🎟 نمایش سهمیه فعلاً ممکن نیست."
+    return quota_text(status)
+
+
+async def _login_password(update):
+    password = (update.message.text or "").strip()
+    try:
+        result = await asyncio.to_thread(access.login, update.effective_user.id, password)
+    except AccessUnavailable:
+        await update.message.reply_text(ACCESS_ERROR)
+        return
+    finally:
+        try:
+            await update.message.delete()
+        except TelegramError:
+            pass
+    if result == "ok":
+        states[update.effective_user.id] = {"stage": "awaiting_query", "last_activity": time.monotonic()}
+        summary = await _quota_summary(update.effective_user.id)
+        await update.message.reply_text("✅ دسترسی تأیید شد.\n" + summary + "\n\n" + WELCOME)
+    elif result == "throttled":
+        await update.message.reply_text("تلاش‌ها زیاد شد؛ یک دقیقه دیگر رمز را امتحان کنید.")
+    else:
+        await update.message.reply_text("رمز معتبر نیست یا دسترسی آن غیرفعال شده. دوباره بفرستید.")
+
+
 # ============================================================
 # /START
 # ============================================================
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _private_chat(update):
+        return
     uid = update.effective_user.id
-
-    clear_user(
-        uid
-    )
-
-    states[uid] = {
-        "stage": "awaiting_query",
-        "last_activity": time.monotonic()
-    }
-
-    await update.effective_message.reply_text(
-        WELCOME,
-        reply_markup=keyboard(
-            [
-                (
-                    " کاکه لغو ؟❌",
-                    "cancel"
-                )
-            ]
-        )
-    )
+    clear_user(uid)
+    states[uid] = {"stage": "awaiting_password", "last_activity": time.monotonic()}
+    try:
+        await asyncio.to_thread(access.logout, uid)
+    except AccessUnavailable:
+        await update.effective_message.reply_text(ACCESS_ERROR)
+        return
+    await update.effective_message.reply_text(PASSWORD_PROMPT)
 
 
 # ============================================================
@@ -229,6 +281,9 @@ async def cancel(
     clear_user(
         uid
     )
+
+    if not await _require_access(update):
+        return
 
     states[uid] = {
         "stage": "awaiting_query",
@@ -281,6 +336,14 @@ async def text_handler(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
+    if not await _private_chat(update):
+        return
+    if states.get(update.effective_user.id, {}).get("stage") == "awaiting_password":
+        await _login_password(update)
+        return
+    if not await _require_access(update):
+        return
+
     uid = update.effective_user.id
 
     st = states.get(
@@ -325,6 +388,7 @@ async def text_handler(
         "stage": "choose_sort",
         "query": q,
         "sort_token": token,
+        "request_id": str(uuid.uuid4()),
         "last_activity": time.monotonic()
     }
     await update.message.reply_text(
@@ -644,6 +708,32 @@ async def confirm_search(
     await query_obj.answer()
 
 
+    # The debit is atomic and persistent; a retry uses the same request ID.
+    try:
+        quota = await asyncio.to_thread(
+            access.reserve, uid, states[uid]["request_id"]
+        )
+    except AccessUnavailable:
+        await query_obj.message.reply_text(
+            ACCESS_ERROR,
+            reply_markup=keyboard([("تلاش دوباره", "confirm")], [("لغو ❌", "cancel")])
+        )
+        return
+    if not quota["allowed"]:
+        reason = quota.get("reason")
+        if reason == "auth":
+            clear_user(uid)
+            states[uid] = {"stage": "awaiting_password", "last_activity": time.monotonic()}
+            text = PASSWORD_PROMPT
+        elif reason == "daily":
+            text = "سهمیهٔ امروز شما تمام شده؛ از نیمه‌شب به وقت تهران دوباره می‌توانید جست‌وجو کنید."
+        else:
+            text = "سهمیهٔ یک ساعت اخیر شما تمام شده؛ پس از گذشت یک ساعت از جست‌وجوهای قبلی دوباره امتحان کنید."
+        if reason != "auth":
+            text += "\n" + quota_text(quota)
+        await query_obj.message.reply_text(text)
+        return
+
     ev = threading.Event()
 
     jobs[uid] = ev
@@ -661,7 +751,8 @@ async def confirm_search(
     await query_obj.message.reply_text(
 
         "🔎 جستجو شروع شد. "
-        "ممکن است چند دقیقه طول بکشد.پیروز بیت ❤️",
+        "ممکن است چند دقیقه طول بکشد.پیروز بیت ❤️"
+        + "\n" + quota_text(quota),
 
         reply_markup=keyboard(
             [
@@ -736,8 +827,9 @@ async def confirm_search(
         }
 
 
+        summary = await _quota_summary(uid)
         await query_obj.message.reply_text(
-            f"✅ {len(results)} پیشنهاد آماده شد."
+            f"✅ {len(results)} پیشنهاد آماده شد.\n{summary}"
         )
 
 
@@ -833,6 +925,9 @@ async def buttons(
 
     data = q.data
 
+
+    if data != "cancel" and not await _require_access(update):
+        return
 
     # Cancel
     if data == "cancel":
@@ -1001,7 +1096,7 @@ async def error_handler(
 
 def run_bot():
 
-    global engine
+    global engine, access
 
 
     token = os.getenv(
@@ -1023,6 +1118,7 @@ def run_bot():
 
 
     engine = FSKEngine()
+    access = AccessControl(engine.sb)
 
 
     print(
