@@ -1,7 +1,8 @@
 import threading
 from flask import Flask
 from telegram_bot import run_bot
-
+from dotenv import load_dotenv
+load_dotenv()
 
 # =========================
 # Render Health Server
